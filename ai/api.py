@@ -5,7 +5,7 @@ from typing import Annotated, Sequence, TypedDict
 from langchain_core.messages import (BaseMessage, HumanMessage, AIMessage, ToolMessage, SystemMessage)
 from langgraph.checkpoint.postgres import PostgresSaver
 from typing import Any
-
+import requests
 
 class InputMessage(BaseModel):
     thread_id: str
