@@ -16,6 +16,8 @@ url_object = URL.create(
 
 DB_URI = url_object.render_as_string(hide_password=False)
 
+print(DB_URI)
+
 
 with PostgresSaver.from_conn_string(DB_URI) as checkpointer:
     # Creates necessary internal checkpoint tables if they don't exist
