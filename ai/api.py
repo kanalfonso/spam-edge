@@ -1,37 +1,31 @@
 from fastapi import FastAPI
-from agent import graph
+from agent import stream_agent_response
 from pydantic import BaseModel
-from typing import Annotated, Sequence, TypedDict
-from langchain_core.messages import (BaseMessage, HumanMessage, AIMessage, ToolMessage, SystemMessage)
-from langgraph.checkpoint.postgres import PostgresSaver
+from langchain_core.messages import HumanMessage
+from fastapi.responses import StreamingResponse
 from typing import Any
-import requests
 
+
+# AKA the payload
 class InputMessage(BaseModel):
     thread_id: str
     messages: str
+
 
 fastapi_app = FastAPI()
 
 
 
-@fastapi_app.post("/generate_response", response_model=dict[str, Any])
+@fastapi_app.post("/generate_response")
 def generate_response(message: InputMessage):
 
-    DB_URI = "postgresql://postgres:postgres@localhost:5432/chathistory_db"
-    CONFIG = {
-        "configurable": {
-            "thread_id": "thread-1"
+    streamed_response = stream_agent_response(
+        input={'messages': [HumanMessage(content=message.messages)]},
+        config={
+            "configurable": {
+                "thread_id": message.thread_id
+            }
         }
-    }
+    )
 
-    with PostgresSaver.from_conn_string(DB_URI) as checkpointer:
-        app = graph.compile(checkpointer=checkpointer)
-
-        response = app.invoke(
-            input=message,
-            config=CONFIG
-        )
-
-    latest_message = response["messages"][-1]
-    return latest_message.model_dump()
+    return StreamingResponse(streamed_response, media_type='text/plain')
