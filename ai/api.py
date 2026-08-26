@@ -1,5 +1,5 @@
 from fastapi import FastAPI
-from agent import stream_agent_response
+from ai.graph import stream_agent_response
 from pydantic import BaseModel
 from langchain_core.messages import HumanMessage
 from fastapi.responses import StreamingResponse

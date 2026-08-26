@@ -1,0 +1,5 @@
+APIs 
+- Google Custom Search API
+- Google Safebrowsing API
+- Google Web Risk API (Extended Coverage)
+- pytrends (unofficial API for Google Trends)

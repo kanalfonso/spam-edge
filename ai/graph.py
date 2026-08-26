@@ -1,7 +1,4 @@
-# refe
-
 # Standard Libraies
-import os
 from typing import Annotated, Sequence, TypedDict
 from dotenv import load_dotenv
 import time
@@ -17,19 +14,14 @@ from langgraph.graph import StateGraph, START, END
 
 
 from langgraph.checkpoint.postgres import PostgresSaver
-from langgraph.store.postgres import PostgresStore
 
 
 # for annotation
-from langgraph.graph.state import CompiledStateGraph
-from langchain_core.runnables import RunnableConfig
 from langgraph.config import get_stream_writer
-
 from langchain_core.messages import AIMessageChunk
-import json
-import asyncio
 
 load_dotenv()
+
 
 ####### CONFIGS #######
 SYSTEM_MESSAGE_PATH = "messages/system_message.txt" 
@@ -60,7 +52,9 @@ class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
 
 
+
 def model_node(state: AgentState) -> dict:
+    """Invoke basic model"""
 
     # writer = get_stream_writer()
     # writer({'status': 'Model is generating a response...'})
@@ -80,7 +74,7 @@ def model_node(state: AgentState) -> dict:
     return {'messages': [AIMessage(response.content)]}
 
 
-## Create graph ##
+## Create graph / execution workflow##
 graph = (
     StateGraph(AgentState)
         .add_node("model_node", model_node)
@@ -95,19 +89,24 @@ def stream_agent_response(
         input: Sequence[BaseMessage], 
         config: dict[str, any]
     ):
-    
+    """Function used to help stream the response of the AI"""
+
+
     # use checkpointer to elegantly manage convo history
     with PostgresSaver.from_conn_string(DB_URI) as checkpointer:
 
         # checkpointer.setup()
 
-        # compile graph
+        # compile graph with checkpointer for memory
         compiled_graph = graph.compile(checkpointer=checkpointer)
 
         for chunk in compiled_graph.stream(
             input=input, 
             config=config,
-            stream_mode=["messages"],
+            stream_mode=[
+                "custom",   # from stream writer
+                "messages"  # response when LLM is invoked
+            ],
             version="v2"
         ):
 
@@ -121,7 +120,7 @@ def stream_agent_response(
                     
                     yield message_chunk.content
                     # print(f"{time.time() - start:.2f}s: {message_chunk.content!r}")
-
+            # if chunk["type"] == "custom":
 
 
 
@@ -148,3 +147,4 @@ if __name__ == '__main__':
         user_input = input("You: ")
         
 
+## TODO: not exactly streaming in real time
