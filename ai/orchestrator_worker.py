@@ -17,6 +17,9 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.config import get_stream_writer
 
 
+from langgraph.prebuilt import ToolNode
+from pydantic import BaseModel, ConfigDict
+
 # Configs
 MODEL = "qwen2.5:7b"
 load_dotenv()
@@ -34,6 +37,15 @@ base_llm = ChatOllama(
     keep_alive="30m"
 )
 
+class SearchArgsSchema(BaseModel):
+    """This tool accepts only runtime as an argument"""
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    runtime: ToolRuntime
+
+    search_query: str = Field(
+        description="A concise, search-engine-optimized query based on the user's request"
+    )
 
 
 class Classification(BaseModel):
@@ -63,19 +75,28 @@ class GraphState(TypedDict):
     classification: Classification
 
 
-# # Search Engine Tools
-# @tool(name="duckduckgo_search_tool", description="Uses the DuckDuckGo search engine for basic user request")
-# def duckduckgo_search_tool(runtime: ToolRuntime) -> str:
-#     """Displays search results of the user request via DuckDuckGo"""
+# Search Engine Tools
+@tool(name_or_callable="duckduckgo_search_tool", description="Uses the DuckDuckGo search engine for basic user request", args_schema=SearchArgsSchema)
+def duckduckgo_search_tool(runtime: ToolRuntime, search_query: str) -> str:
+    """
+    Displays search results of the user request via DuckDuckGo.
 
-#     return f"Used DuckDuckGo to search for {runtime.state['user_query']}"
+    No `args` passed to this function
+    """
+
+    return f"Used DuckDuckGo to search for {runtime.state['user_query']}. Processed by LLM: {search_query}. Latest scam is phishing"
 
 
-# @tool(name="arxiv_search_tool", description="Use this tool to conduct a deep-dive or academic research on user request")
-# def arxiv_search_tool(runtime: ToolRuntime) -> str:
-#     """Displays search results of the user request via arXiv"""
 
-#     return f"Used arXiv to search for {runtime.state['user_query']}"
+@tool(name_or_callable="arxiv_search_tool", description="Use this tool to conduct a deep-dive or academic research on user request", args_schema=SearchArgsSchema)
+def arxiv_search_tool(runtime: ToolRuntime, search_query: str) -> str:
+    """Displays search results of the user request via arXiv"""
+
+    return f"Used arXiv to search for {runtime.state['user_query']}. Processed by LLM: {search_query}. Latest scam is smishing."
+
+
+search_tools = [duckduckgo_search_tool, arxiv_search_tool]
+search_tool_node = ToolNode(search_tools)
 
 
 # Step 1: Supervisor Node
@@ -101,22 +122,44 @@ def orcherstrator_node(state: GraphState) -> dict:
 
 # a) Search Engine sub-agent
 def search_engine_node(state: GraphState) -> dict:
-    # search_engine_llm = base_llm.bind_tools(tools=[duckduckgo_search_tool, arxiv_search_tool])
+    search_engine_llm = base_llm.bind_tools(tools=search_tools, tool_choice="any")
 
     writer = get_stream_writer()
     writer({"status": "Using search engine..."})
     
-    user_query = [HumanMessage(state['user_query'])]
-    # search_engine_response = search_engine_llm.invoke(user_query)
+    messages = state["messages"]
 
-    search_engine_response = base_llm.invoke(
-        [SystemMessage("Keep answers short, just 2-3 sentences at most.")] + user_query
-    )
+    # If we already have tool results, let the LLM
+    # synthesize the final answer WITHOUT forcing another tool call.
+    if isinstance(messages[-1], ToolMessage):
 
-    writer = get_stream_writer()
-    writer({"status": "Processing with search engine..."})
+        response = base_llm.invoke(
+            [
+                SystemMessage(
+                    content="Use the search results to answer the user's request. "
+                            "Keep the answer concise."
+                )
+            ] + list(messages)
+        )
 
-    return {'messages': [AIMessage(search_engine_response.content)]}
+    else:
+        search_engine_llm = base_llm.bind_tools(
+            tools=search_tools,
+            tool_choice="any"
+        )
+
+        response = search_engine_llm.invoke(
+            [
+                SystemMessage(
+                    content="Use the available search tools to find information "
+                            "needed to answer the user's request."
+                )
+            ] + list(messages)
+        )
+
+    return {
+        "messages": [response]
+    }
 
 
 
@@ -146,30 +189,67 @@ def decide_next_node(state: GraphState):
         return "safe_browsing_test_path"
     
     elif classification.destination_node == "web_risk_test":
-        return "web_browsing_test_path"
+        return "web_risk_test_path"
 
+
+
+def should_continue(state: GraphState):
+    """Decide if we should continue the loop or stop based upon whether the LLM made a tool call"""
+
+    messages = state["messages"]
+    last_message = messages[-1]
+
+    # If the LLM makes a tool call, then perform an action
+    if last_message.tool_calls:
+        return "search_tool_node_path"
+
+    # Otherwise, we stop (reply to the user)
+    return "end_path"
 
 
 workflow = (
     StateGraph(GraphState)
         .add_node("orchestrator_node", orcherstrator_node)
         .add_node("search_engine_node", search_engine_node)
+
+        .add_node("search_tool_node", search_tool_node)
+        
         .add_node("safe_browsing_test_node", safe_browsing_test_node)
         .add_node("web_risk_test_node", web_risk_test_node)
+
         
+        # edges
 
         .add_edge(START, "orchestrator_node")
+
+
+        # choose sub-agent
         .add_conditional_edges(
             source="orchestrator_node",
             path=decide_next_node,
             path_map={
                 "search_engine_path": "search_engine_node",
                 "safe_browsing_test_path": "safe_browsing_test_node",
-                "web_browsing_test_path": "web_risk_test_node"
+                "web_risk_test_path": "web_risk_test_node"
             }
         )
 
-        .add_edge("search_engine_node", END)
+
+        # call tool or immediately end
+        .add_conditional_edges(
+            source="search_engine_node",
+            path=should_continue,
+            path_map={
+                "search_tool_node_path": "search_tool_node",
+                "end_path": END
+            }
+
+
+        )
+
+        # pass tool output back to 
+        .add_edge("search_tool_node", "search_engine_node")
+
         .add_edge("safe_browsing_test_node", END)
         .add_edge("web_risk_test_node", END)
 
@@ -207,11 +287,42 @@ workflow = (
 
 # Conversation Flow
 if __name__ == "__main__":
+    png_data = workflow.get_graph().draw_mermaid_png()
+    with open("graph.png", "wb") as f:
+        f.write(png_data)
+    print("Graph saved as graph.png")
+
 
     user_input = input("First message: ")
 
-    while user_input != 'exit':
+    while user_input != "exit":
         processed_message = [HumanMessage(content=user_input)]
+
+
+
+    #     response = workflow.invoke(
+    #         input={
+    #             "messages": processed_message,
+    #             "user_query": user_input
+    #         }
+    #     )
+
+    #     for message in response["messages"]:
+    #         if isinstance(message, AIMessage):
+    #             message.pretty_print()
+
+    #             if message.tool_calls:
+    #                 print("\n🔧 TOOL CALLS:")
+    #                 for tool_call in message.tool_calls:
+    #                     print(f"  Tool: {tool_call['name']}")
+    #                     print(f"  Args: {tool_call['args']}")
+
+    #         elif isinstance(message, ToolMessage):
+    #             print("\n🛠️ TOOL RESULT:")
+    #             message.pretty_print()
+
+    #     user_input = input("Next message: ")
+
 
         for chunk in workflow.stream(
             {"messages": processed_message, "user_query": user_input},
@@ -237,3 +348,5 @@ if __name__ == "__main__":
         
         # 3. Prompt for next input to avoid infinite loop
         user_input = input("Next message: ")
+
+
