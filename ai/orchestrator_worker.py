@@ -20,6 +20,11 @@ from langgraph.config import get_stream_writer
 from langgraph.prebuilt import ToolNode
 from pydantic import BaseModel, ConfigDict
 
+from langgraph.types import interrupt, Command
+from langgraph.stream import ProtocolEvent, StreamChannel, StreamTransformer
+
+from langgraph.checkpoint.memory import InMemorySaver
+
 # Configs
 MODEL = "qwen2.5:7b"
 load_dotenv()
@@ -36,6 +41,25 @@ base_llm = ChatOllama(
     temperature=0,
     keep_alive="30m"
 )
+
+
+class CustomTransformer(StreamTransformer):
+    required_stream_modes = ("custom",)
+
+    def __init__(self, scope: tuple[str, ...] = ()) -> None:
+        super().__init__(scope)
+        self.log = StreamChannel()
+
+    def init(self) -> dict:
+        return {"custom": self.log}
+
+    def process(self, event: ProtocolEvent) -> bool:
+        if event["method"] == "custom":
+            self.log.push(event["params"]["data"])
+        return True
+
+
+
 
 class SearchArgsSchema(BaseModel):
     """This tool accepts only runtime as an argument"""
@@ -73,6 +97,7 @@ class GraphState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
     # classifications: list[Classification]
     classification: Classification
+    interruption_response: str
 
 
 # Search Engine Tools
@@ -126,6 +151,8 @@ def search_engine_node(state: GraphState) -> dict:
 
     writer = get_stream_writer()
     writer({"status": "Using search engine..."})
+
+    interruption_response = interrupt("Do you want to proceed with search?")
     
     messages = state["messages"]
 
@@ -158,7 +185,8 @@ def search_engine_node(state: GraphState) -> dict:
         )
 
     return {
-        "messages": [response]
+        "messages": [response],
+        "interruption_response": interruption_response
     }
 
 
@@ -253,100 +281,66 @@ workflow = (
         .add_edge("safe_browsing_test_node", END)
         .add_edge("web_risk_test_node", END)
 
-        .compile()        
+        .compile(checkpointer=InMemorySaver())
 )
 
 
 
+def main():
+    """Conversation loop"""
 
-
-# # Conversation Flow
-# if __name__ == "__main__":
-
-#     # Conversation flow
-#     user_input = input("First message: ")
-
-#     while user_input != 'exit':
-#         processed_message = [HumanMessage(content=user_input)]
-
-#         for chunk in workflow.stream(
-#             {"messages": processed_message},
-#             stream_mode=["custom", "messages"],
-#             version="v2",
-#         ):
-#             if chunk["type"] == "messages":
-#                 message_chunk, metadata = chunk["data"]
-
-#                 # Filter for streaming chunks only (ignores full AIMessage objects)
-#                 if isinstance(message_chunk, AIMessageChunk) and message_chunk.content:
-#                     print(message_chunk.content, end="", flush=True)
-
-#             elif chunk["type"] == "custom":
-#                 print(f"Status: {chunk['data']['status']}")
-
-
-# Conversation Flow
-if __name__ == "__main__":
     png_data = workflow.get_graph().draw_mermaid_png()
     with open("graph.png", "wb") as f:
         f.write(png_data)
-    print("Graph saved as graph.png")
+        print("Graph saved as graph.png")
+
+    config = {"configurable": {"thread_id": "1"}}
 
 
     user_input = input("First message: ")
 
     while user_input != "exit":
-        processed_message = [HumanMessage(content=user_input)]
+        stream_input = {"messages": [HumanMessage(content=user_input)], "user_query": user_input}
+
+        while stream_input is not None: 
+            stream = workflow.stream_events(
+                input=stream_input,
+                config=config,
+                version='v3',
+                transformers=[CustomTransformer]
+            )        
+
+            for name, item in stream.interleave("messages", "custom"):
+                if name == "messages":
+                    message = item
+
+                    if message.node == "orchestrator_node":
+                        continue
+
+                    for token in message.text:
+                        print(token, end="", flush=True)
+
+                elif name == "custom":
+                    print(f"\n[STATUS]: {item['status']}")
+            
 
 
+            if stream.interrupted:
+                interrupt_info = stream.interrupts[0].value
+                user_response = input(f"[INTERRUPT] {interrupt_info}: ")
 
-    #     response = workflow.invoke(
-    #         input={
-    #             "messages": processed_message,
-    #             "user_query": user_input
-    #         }
-    #     )
+                stream_input = Command(resume=user_response)
 
-    #     for message in response["messages"]:
-    #         if isinstance(message, AIMessage):
-    #             message.pretty_print()
-
-    #             if message.tool_calls:
-    #                 print("\n🔧 TOOL CALLS:")
-    #                 for tool_call in message.tool_calls:
-    #                     print(f"  Tool: {tool_call['name']}")
-    #                     print(f"  Args: {tool_call['args']}")
-
-    #         elif isinstance(message, ToolMessage):
-    #             print("\n🛠️ TOOL RESULT:")
-    #             message.pretty_print()
-
-    #     user_input = input("Next message: ")
-
-
-        for chunk in workflow.stream(
-            {"messages": processed_message, "user_query": user_input},
-            stream_mode=["custom", "messages"],
-            version="v2",
-        ):
-            if chunk["type"] == "messages":
-                message_chunk, metadata = chunk["data"]
-
-                # 1. Ignore messages from the orchestrator node (prevents printing JSON)
-                if metadata.get("langgraph_node") == "orchestrator_node":
-                    continue
-
-                # 2. Print messages from actual subagent nodes (handles AIMessage and AIMessageChunk)
-                if isinstance(message_chunk, BaseMessage) and message_chunk.content:
-                    print(message_chunk.content, end="", flush=True)
-
-            elif chunk["type"] == "custom":
-                # Add newlines around custom status updates for cleaner formatting
-                print(f"\nStatus: {chunk['data']['status']}", flush=True)
-
-        print("\n")  # Newline after workflow finishes
+            else:
+                # no more interrupts
+                stream_input = None
         
         # 3. Prompt for next input to avoid infinite loop
-        user_input = input("Next message: ")
+        user_input = input("\nNext message: ")
 
+
+
+# Conversation Flow
+if __name__ == "__main__":
+    main()
 
