@@ -7,9 +7,7 @@ from pydantic import BaseModel, Field
 
 # Langchain imports
 from langchain_ollama import ChatOllama
-from langchain_core.messages import (BaseMessage, HumanMessage, AIMessage, ToolMessage, SystemMessage, AIMessageChunk)
-from langchain.tools import tool, ToolRuntime
-from langchain.agents import create_agent
+from langchain_core.messages import (BaseMessage, HumanMessage, AIMessage, ToolMessage, SystemMessage)
 
 # Langraph imports
 from langgraph.graph.message import add_messages
@@ -18,23 +16,32 @@ from langgraph.config import get_stream_writer
 
 
 from langgraph.prebuilt import ToolNode
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel
 
 from langgraph.types import interrupt, Command
 from langgraph.stream import ProtocolEvent, StreamChannel, StreamTransformer
-
 from langgraph.checkpoint.memory import InMemorySaver
+
+
+# for tracing
+from langsmith import traceable
+
+
+# tool imports
+from web_search import arxiv_search_tool, duckduckgo_search_tool
+
 
 # Configs
 MODEL = "qwen2.5:7b"
 load_dotenv()
 
-SEARCH_PLANNER_SYSTEM_MESSAGE = SystemMessage(
-    content=
-    """
-    You are a Search Planner responsible for converting a user's request into an effective search strategy.
-    """
-)
+
+# messages
+with open('messages/orchestrator_sys_msg.txt', 'r') as file:
+    ORCHESTRATOR_SYS_MSG_FILE = file.read()
+
+ORCHESTRATOR_SYS_MSG = SystemMessage(content=ORCHESTRATOR_SYS_MSG_FILE)
+
 
 base_llm = ChatOllama(
     model=MODEL,
@@ -60,64 +67,21 @@ class CustomTransformer(StreamTransformer):
 
 
 
-
-class SearchArgsSchema(BaseModel):
-    """This tool accepts only runtime as an argument"""
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    runtime: ToolRuntime
-
-    search_query: str = Field(
-        description="A concise, search-engine-optimized query based on the user's request"
-    )
-
-
 class Classification(BaseModel):
     """A single routing decision: which agent to call with what query."""
-    destination_node: Literal["search_engine", "safe_browsing_test", "web_risk_test"] = Field(
+    destination_node: Literal["search_engine", "web_risk_test"] = Field(
         description="The next specialized node to handle the task"
     )
-    # query: str = Field(
-    #     description="Query asked by the user"
-    # )
-
-
-# # Define structured output schema for the classifier
-# class ClassificationResult(BaseModel):
-#     """Result of classifying a user query into agent-specific sub-questions."""
-#     classifications: list[Classification] = Field(
-#         description="List of agents to invoke with their targeted sub-questions"
-#     )
-
 
 
 # Build the graph state
 class GraphState(TypedDict):
     user_query: str         # prompt of user that initiates the workflow
     messages: Annotated[Sequence[BaseMessage], add_messages]
-    # classifications: list[Classification]
     classification: Classification
     interruption_response: str
+    enable_tool_writer: bool
 
-
-# Search Engine Tools
-@tool(name_or_callable="duckduckgo_search_tool", description="Uses the DuckDuckGo search engine for basic user request", args_schema=SearchArgsSchema)
-def duckduckgo_search_tool(runtime: ToolRuntime, search_query: str) -> str:
-    """
-    Displays search results of the user request via DuckDuckGo.
-
-    No `args` passed to this function
-    """
-
-    return f"Used DuckDuckGo to search for {runtime.state['user_query']}. Processed by LLM: {search_query}. Latest scam is phishing"
-
-
-
-@tool(name_or_callable="arxiv_search_tool", description="Use this tool to conduct a deep-dive or academic research on user request", args_schema=SearchArgsSchema)
-def arxiv_search_tool(runtime: ToolRuntime, search_query: str) -> str:
-    """Displays search results of the user request via arXiv"""
-
-    return f"Used arXiv to search for {runtime.state['user_query']}. Processed by LLM: {search_query}. Latest scam is smishing."
 
 
 search_tools = [duckduckgo_search_tool, arxiv_search_tool]
@@ -125,15 +89,16 @@ search_tool_node = ToolNode(search_tools)
 
 
 # Step 1: Supervisor Node
-def orcherstrator_node(state: GraphState) -> dict:
+@traceable(run_type="chain")
+def orchestrator_node(state: GraphState) -> dict:
     """Routes node based on user request"""
 
     writer = get_stream_writer()
-    writer({"status": "Attempting to route user request..."})
+    writer({"status": "Orchestrator: Routing user request..."})
 
     orchestrator_llm = base_llm.with_structured_output(Classification)
 
-    conversation_history = [SEARCH_PLANNER_SYSTEM_MESSAGE] + state['messages']
+    conversation_history = [ORCHESTRATOR_SYS_MSG] + state['messages']
 
     orchestrator_response = orchestrator_llm.invoke(input=conversation_history)
 
@@ -146,19 +111,21 @@ def orcherstrator_node(state: GraphState) -> dict:
 # Step 2: Sub-agent nodes
 
 # a) Search Engine sub-agent
+@traceable(run_type="chain")
 def search_engine_node(state: GraphState) -> dict:
     search_engine_llm = base_llm.bind_tools(tools=search_tools, tool_choice="any")
 
     writer = get_stream_writer()
-    writer({"status": "Using search engine..."})
 
-    interruption_response = interrupt("Do you want to proceed with search?")
+    # interruption_response = interrupt("Do you want to proceed with search?")
     
     messages = state["messages"]
 
     # If we already have tool results, let the LLM
     # synthesize the final answer WITHOUT forcing another tool call.
     if isinstance(messages[-1], ToolMessage):
+
+        writer({"status": "Search Node: Summarizing search tool results..."})
 
         response = base_llm.invoke(
             [
@@ -170,6 +137,9 @@ def search_engine_node(state: GraphState) -> dict:
         )
 
     else:
+        writer({"status": "Search Node: Using search engine tool..."})
+
+
         search_engine_llm = base_llm.bind_tools(
             tools=search_tools,
             tool_choice="any"
@@ -186,19 +156,21 @@ def search_engine_node(state: GraphState) -> dict:
 
     return {
         "messages": [response],
-        "interruption_response": interruption_response
+        # "interruption_response": interruption_response
     }
 
 
 
 # b) Web Risk sub-agent
+@traceable(run_type="chain")
 def web_risk_test_node(state: GraphState) -> dict:
     writer = get_stream_writer()
     writer({"status": "Conducting Web Risk API test..."})
     return {"messages": [AIMessage(f"The LLM chose to use `{state['classification'].destination_node}`. Went to the web risk node")]}
 
 
-# c) Safe browsing sub-agent 
+# c) Safe browsing sub-agent
+@traceable(run_type="chain")
 def safe_browsing_test_node(state: GraphState) -> dict:
     writer = get_stream_writer()
     writer({"status": "Conducting Safe Browsing API test..."})
@@ -206,8 +178,9 @@ def safe_browsing_test_node(state: GraphState) -> dict:
 
 
 
-# Step 3: Routing Logic
+# Step 3: Routing Logic for Sub-agents
 def decide_next_node(state: GraphState):
+    """For orchestrator routing to sub agents"""
     classification = state['classification']
 
     if classification.destination_node == "search_engine":
@@ -221,6 +194,7 @@ def decide_next_node(state: GraphState):
 
 
 
+# For contiuining or ending loop
 def should_continue(state: GraphState):
     """Decide if we should continue the loop or stop based upon whether the LLM made a tool call"""
 
@@ -237,7 +211,7 @@ def should_continue(state: GraphState):
 
 workflow = (
     StateGraph(GraphState)
-        .add_node("orchestrator_node", orcherstrator_node)
+        .add_node("orchestrator_node", orchestrator_node)
         .add_node("search_engine_node", search_engine_node)
 
         .add_node("search_tool_node", search_tool_node)
@@ -271,9 +245,8 @@ workflow = (
                 "search_tool_node_path": "search_tool_node",
                 "end_path": END
             }
-
-
         )
+
 
         # pass tool output back to 
         .add_edge("search_tool_node", "search_engine_node")
@@ -300,7 +273,12 @@ def main():
     user_input = input("First message: ")
 
     while user_input != "exit":
-        stream_input = {"messages": [HumanMessage(content=user_input)], "user_query": user_input}
+
+        stream_input = {
+            "messages": [HumanMessage(content=user_input)], 
+            "user_query": user_input,
+            "enable_tool_writer": True
+        }
 
         while stream_input is not None: 
             stream = workflow.stream_events(
