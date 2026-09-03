@@ -66,6 +66,17 @@ class CustomTransformer(StreamTransformer):
         return True
 
 
+### Pydantic validation schemas
+class Query(BaseModel):
+    """Validation for search query"""
+    search_query: str = Field(
+        description="A concise, search-engine-optimized query based on the user's request"
+    )
+
+
+class QueryList(BaseModel):
+    """Collection of search queries"""
+    query_list: list[Query]
 
 class Classification(BaseModel):
     """A single routing decision: which agent to call with what query."""
@@ -74,7 +85,8 @@ class Classification(BaseModel):
     )
 
 
-# Build the graph state
+
+### States
 class GraphState(TypedDict):
     user_query: str         # prompt of user that initiates the workflow
     messages: Annotated[Sequence[BaseMessage], add_messages]
@@ -85,47 +97,44 @@ class GraphState(TypedDict):
 
 
 class InputState(TypedDict):
-    """Schema of keys exposed to input state"""
+    """Input state accepted by the graph at invocation."""
     messages: Annotated[Sequence[BaseMessage], add_messages]
     user_query: str
     enable_tool_writer: bool
 
 
-class OrchestratorInputState(InputState):
-    """Schema of keys exposed to orchestrator input state"""
-    pass
+class OrchestratorInputState(TypedDict):
+    """Input state required by the orchestrator node to make routing decisions."""
+    messages: Annotated[Sequence[BaseMessage], add_messages]
+    user_query: str
+
 
 
 class OrchestratorOutputState(TypedDict):
-    """Schema of keys exposed to orchestrator state"""
+    """Output state produced by the orchestrator node containing the routing classification."""
     classification: Classification
 
 
 
 class OutputState(TypedDict):
-    """Schema of keys exposed to output state"""
+    """Output state produced by the graph at invocation."""
     final_response: BaseMessage
 
 
 
 class QueryGenerationInputState(TypedDict):
+    """Input state required by the `generate_search_queries_node` function"""
     messages: Annotated[Sequence[BaseMessage], add_messages]
     user_query: str
 
 
-class Query(BaseModel):
-    search_query: str = Field(
-        description="A concise, search-engine-optimized query based on the user's request"
-    )
-
-
-class QueryList(BaseModel):
-    query_list: list[Query]
-
 class QueryGenerationOutputState(TypedDict):
+    """Output state produced by the `generate_search_queries_node` function"""
     query_list: list[Query]
 
 
+
+### tools
 search_tools = [duckduckgo_search_tool, arxiv_search_tool]
 search_tool_node = ToolNode(search_tools)
 
