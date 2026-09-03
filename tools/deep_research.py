@@ -2,7 +2,10 @@ from langchain.tools import tool, ToolRuntime
 from pydantic import Field, BaseModel
 from langsmith import traceable
 from tools.tool_utils import write_tool_status
+# from tool_utils import write_tool_status
+from unittest.mock import MagicMock
 
+    
 
 class SearchArgsSchema(BaseModel):
     """This tool accepts only runtime as an argument"""
@@ -62,8 +65,6 @@ def duckduckgo_search_tool(runtime: ToolRuntime, search_query: str) -> str:
 
 
 if __name__ == "__main__":
-    from unittest.mock import MagicMock
-    
     mock_state = {"user_query": "What are recent online scams?"}
 
     # Create a mock runtime object with the required state dictionary

@@ -28,7 +28,7 @@ from langsmith import traceable
 
 
 # tool imports
-from web_search import arxiv_search_tool, duckduckgo_search_tool
+from tools.deep_research import arxiv_search_tool, duckduckgo_search_tool
 
 
 # Configs
@@ -84,13 +84,55 @@ class GraphState(TypedDict):
 
 
 
+class InputState(TypedDict):
+    """Schema of keys exposed to input state"""
+    messages: Annotated[Sequence[BaseMessage], add_messages]
+    user_query: str
+    enable_tool_writer: bool
+
+
+class OrchestratorInputState(InputState):
+    """Schema of keys exposed to orchestrator input state"""
+    pass
+
+
+class OrchestratorOutputState(TypedDict):
+    """Schema of keys exposed to orchestrator state"""
+    classification: Classification
+
+
+
+class OutputState(TypedDict):
+    """Schema of keys exposed to output state"""
+    final_response: BaseMessage
+
+
+
+class QueryGenerationInputState(TypedDict):
+    messages: Annotated[Sequence[BaseMessage], add_messages]
+    user_query: str
+
+
+class Query(BaseModel):
+    search_query: str = Field(
+        description="A concise, search-engine-optimized query based on the user's request"
+    )
+
+
+class QueryList(BaseModel):
+    query_list: list[Query]
+
+class QueryGenerationOutputState(TypedDict):
+    query_list: list[Query]
+
+
 search_tools = [duckduckgo_search_tool, arxiv_search_tool]
 search_tool_node = ToolNode(search_tools)
 
 
 # Step 1: Supervisor Node
 @traceable(run_type="chain")
-def orchestrator_node(state: GraphState) -> dict:
+def orchestrator_node(state: OrchestratorInputState) -> OrchestratorOutputState:
     """Routes node based on user request"""
 
     writer = get_stream_writer()
@@ -100,15 +142,39 @@ def orchestrator_node(state: GraphState) -> dict:
 
     conversation_history = [ORCHESTRATOR_SYS_MSG] + state['messages']
 
-    orchestrator_response = orchestrator_llm.invoke(input=conversation_history)
+    orchestrator_response: Classification = orchestrator_llm.invoke(input=conversation_history)
 
     # return {"classifications": orchestrator_response.classifications}
 
-    return {"classification": orchestrator_response}
+    return {
+        "classification": orchestrator_response
+    }
 
 
 
 # Step 2: Sub-agent nodes
+def generate_search_queries_node(state: QueryGenerationInputState) -> QueryGenerationOutputState:
+    
+
+    ### insert llm logic to generate queries
+    query_generator_llm = base_llm.with_structured_output(QueryList)
+
+    conversation_history = [QUERY_GENERATOR_SYS_MSG] + state['messages']
+
+    generated_queries: QueryList = query_generator_llm.invoke(input=conversation_history)
+
+
+    return {
+        "query_list": generated_queries
+    }
+
+
+
+
+
+### TODO:
+
+
 
 # a) Search Engine sub-agent
 @traceable(run_type="chain")
@@ -154,9 +220,9 @@ def search_engine_node(state: GraphState) -> dict:
             ] + list(messages)
         )
 
+
     return {
-        "messages": [response],
-        # "interruption_response": interruption_response
+        "messages": [response]
     }
 
 
@@ -169,33 +235,22 @@ def web_risk_test_node(state: GraphState) -> dict:
     return {"messages": [AIMessage(f"The LLM chose to use `{state['classification'].destination_node}`. Went to the web risk node")]}
 
 
-# c) Safe browsing sub-agent
-@traceable(run_type="chain")
-def safe_browsing_test_node(state: GraphState) -> dict:
-    writer = get_stream_writer()
-    writer({"status": "Conducting Safe Browsing API test..."})
-    return {"messages": [AIMessage(f"The LLM chose to use `{state['classification'].destination_node}`. Went to the safe browsing node")]}
-
-
 
 # Step 3: Routing Logic for Sub-agents
-def decide_next_node(state: GraphState):
-    """For orchestrator routing to sub agents"""
+def route_to_agent(state: GraphState) -> str:
+    """For orchestrator routing to agents"""
     classification = state['classification']
 
     if classification.destination_node == "search_engine":
         return "search_engine_path"
-    
-    elif classification.destination_node == "safe_browsing_test":
-        return "safe_browsing_test_path"
     
     elif classification.destination_node == "web_risk_test":
         return "web_risk_test_path"
 
 
 
-# For contiuining or ending loop
-def should_continue(state: GraphState):
+# For continuing or ending loop
+def should_continue(state: GraphState) -> str:
     """Decide if we should continue the loop or stop based upon whether the LLM made a tool call"""
 
     messages = state["messages"]
@@ -210,13 +265,12 @@ def should_continue(state: GraphState):
 
 
 workflow = (
-    StateGraph(GraphState)
+    StateGraph(GraphState, input_schema=InputState, output_schema=OutputState)
         .add_node("orchestrator_node", orchestrator_node)
         .add_node("search_engine_node", search_engine_node)
 
         .add_node("search_tool_node", search_tool_node)
         
-        .add_node("safe_browsing_test_node", safe_browsing_test_node)
         .add_node("web_risk_test_node", web_risk_test_node)
 
         
@@ -228,10 +282,9 @@ workflow = (
         # choose sub-agent
         .add_conditional_edges(
             source="orchestrator_node",
-            path=decide_next_node,
+            path=route_to_agent,
             path_map={
                 "search_engine_path": "search_engine_node",
-                "safe_browsing_test_path": "safe_browsing_test_node",
                 "web_risk_test_path": "web_risk_test_node"
             }
         )
@@ -250,8 +303,6 @@ workflow = (
 
         # pass tool output back to 
         .add_edge("search_tool_node", "search_engine_node")
-
-        .add_edge("safe_browsing_test_node", END)
         .add_edge("web_risk_test_node", END)
 
         .compile(checkpointer=InMemorySaver())
