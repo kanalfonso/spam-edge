@@ -36,11 +36,23 @@ MODEL = "qwen2.5:7b"
 load_dotenv()
 
 
-# messages
-with open('messages/orchestrator_sys_msg.txt', 'r') as file:
+# Prompts
+with open('prompts/01_orchestrator_node/01_system_message.txt', 'r') as file:
     ORCHESTRATOR_SYS_MSG_FILE = file.read()
 
+with open('prompts/02_deep_research_node/01_query_generator_sys_msg.txt', 'r') as file:
+    QUERY_GENERATOR_SYS_MSG_FILE = file.read()
+
+with open('prompts/02_deep_research_node/02_deep_research_sys_msg.txt', 'r') as file:
+    DEEP_RESEARCH_SYS_MSG_FILE = file.read()
+
+
+
 ORCHESTRATOR_SYS_MSG = SystemMessage(content=ORCHESTRATOR_SYS_MSG_FILE)
+QUERY_GENERATOR_SYS_MSG = SystemMessage(content=QUERY_GENERATOR_SYS_MSG_FILE)
+DEEP_RESEARCH_SYS_MSG = SystemMessage(content=DEEP_RESEARCH_SYS_MSG_FILE)
+
+
 
 
 base_llm = ChatOllama(
@@ -76,23 +88,49 @@ class Query(BaseModel):
 
 class QueryList(BaseModel):
     """Collection of search queries"""
-    query_list: list[Query]
+    query_list: list[Query] = Field(..., min_length=1, max_length=3)
+
 
 class Classification(BaseModel):
     """A single routing decision: which agent to call with what query."""
-    destination_node: Literal["search_engine", "web_risk_test"] = Field(
+    destination_node: Literal[
+        "deep_research", 
+        # "risk_assessment"
+    ] = Field(
         description="The next specialized node to handle the task"
     )
 
 
 
+class ResearchFormat(BaseModel):
+    reseach_results: str = Field(
+        # min_length=100,  # Minimum character count
+        # max_length=2000, # Maximum character count
+        description="Summarized findings from search results."
+    )
+
+
 ### States
-class GraphState(TypedDict):
+class OverallState(TypedDict):
+    
+    # keys at inputstate
+    enable_tool_writer: bool
     user_query: str         # prompt of user that initiates the workflow
     messages: Annotated[Sequence[BaseMessage], add_messages]
-    classification: Classification
-    interruption_response: str
-    enable_tool_writer: bool
+    # interruption_response: str
+
+    # from orchestrator node
+    classification: Literal[
+        "deep_research", 
+        # "risk_assesssment"
+    ]
+
+    # from QueryGeneratorOutputState
+    query_list: list[str]
+
+
+    # keys at output state
+    final_response: BaseMessage
 
 
 
@@ -112,7 +150,10 @@ class OrchestratorInputState(TypedDict):
 
 class OrchestratorOutputState(TypedDict):
     """Output state produced by the orchestrator node containing the routing classification."""
-    classification: Classification
+    destination_node: Literal[
+        "deep_research", 
+        # "risk_assesssment"
+    ]
 
 
 
@@ -122,19 +163,30 @@ class OutputState(TypedDict):
 
 
 
-class QueryGenerationInputState(TypedDict):
-    """Input state required by the `generate_search_queries_node` function"""
+class QueryGeneratorInputState(TypedDict):
+    """Input state required by the `search_query_generator_node` function"""
     messages: Annotated[Sequence[BaseMessage], add_messages]
     user_query: str
 
 
-class QueryGenerationOutputState(TypedDict):
-    """Output state produced by the `generate_search_queries_node` function"""
-    query_list: list[Query]
+class QueryGeneratorOutputState(TypedDict):
+    """Output state produced by the `search_query_generator_node` function"""
+    query_list: list[str]
+
+
+class DeepResearchInputState(TypedDict):
+    """Input state required by the `deep_research_node`"""
+    query_list: list[str]
+
+
+class DeepResearchOutputState(TypedDict):
+    """Output state produced by the `deep_research_node"""
+    reseach_results: list[str]
 
 
 
-### tools
+
+### deep research tools
 search_tools = [duckduckgo_search_tool, arxiv_search_tool]
 search_tool_node = ToolNode(search_tools)
 
@@ -153,17 +205,30 @@ def orchestrator_node(state: OrchestratorInputState) -> OrchestratorOutputState:
 
     orchestrator_response: Classification = orchestrator_llm.invoke(input=conversation_history)
 
-    # return {"classifications": orchestrator_response.classifications}
 
     return {
-        "classification": orchestrator_response
+        "destination_node": orchestrator_response.destination_node
     }
 
 
 
-# Step 2: Sub-agent nodes
-def generate_search_queries_node(state: QueryGenerationInputState) -> QueryGenerationOutputState:
+def route_to_agent(state: OrchestratorOutputState) -> str:
+    """For orchestrator routing to agents"""
+    destination_node = state['destination_node']
+
+    if destination_node == "deep_research":
+        return "deep_research_path"
     
+    # elif destination_node == "risk_assesssment":
+    #     return "risk_assesssment_path"
+
+
+
+# Sub-agents
+
+
+def search_query_generator_node(state: QueryGeneratorInputState) -> QueryGeneratorOutputState:
+    """Use LLM to generate search queries (max 3) based on user request"""
 
     ### insert llm logic to generate queries
     query_generator_llm = base_llm.with_structured_output(QueryList)
@@ -174,158 +239,72 @@ def generate_search_queries_node(state: QueryGenerationInputState) -> QueryGener
 
 
     return {
-        "query_list": generated_queries
+        "query_list": [query.search_query for query in generated_queries.query_list]
     }
 
 
 
+def deep_research_node(state: DeepResearchInputState) -> DeepResearchOutputState:
+    """Conduct deep research using LLM"""
+
+    research_llm = base_llm.with_structured_output(ResearchFormat)
 
 
-### TODO:
+    research_results = []
 
+    for query in state['query_list']:
 
+        # format the query
+        query = f"Research Topic: {query}"
+        
+        conversation_history = [DEEP_RESEARCH_SYS_MSG] + [HumanMessage(query)]
 
-# a) Search Engine sub-agent
-@traceable(run_type="chain")
-def search_engine_node(state: GraphState) -> dict:
-    search_engine_llm = base_llm.bind_tools(tools=search_tools, tool_choice="any")
-
-    writer = get_stream_writer()
-
-    # interruption_response = interrupt("Do you want to proceed with search?")
-    
-    messages = state["messages"]
-
-    # If we already have tool results, let the LLM
-    # synthesize the final answer WITHOUT forcing another tool call.
-    if isinstance(messages[-1], ToolMessage):
-
-        writer({"status": "Search Node: Summarizing search tool results..."})
-
-        response = base_llm.invoke(
-            [
-                SystemMessage(
-                    content="Use the search results to answer the user's request. "
-                            "Keep the answer concise."
-                )
-            ] + list(messages)
-        )
-
-    else:
-        writer({"status": "Search Node: Using search engine tool..."})
-
-
-        search_engine_llm = base_llm.bind_tools(
-            tools=search_tools,
-            tool_choice="any"
-        )
-
-        response = search_engine_llm.invoke(
-            [
-                SystemMessage(
-                    content="Use the available search tools to find information "
-                            "needed to answer the user's request."
-                )
-            ] + list(messages)
-        )
+        result: ResearchFormat = research_llm.invoke(input=conversation_history)
+        research_results.append(result)
 
 
     return {
-        "messages": [response]
+        "reseach_results": [result.reseach_results for result in research_results]
     }
 
 
-
-# b) Web Risk sub-agent
-@traceable(run_type="chain")
-def web_risk_test_node(state: GraphState) -> dict:
-    writer = get_stream_writer()
-    writer({"status": "Conducting Web Risk API test..."})
-    return {"messages": [AIMessage(f"The LLM chose to use `{state['classification'].destination_node}`. Went to the web risk node")]}
-
-
-
-# Step 3: Routing Logic for Sub-agents
-def route_to_agent(state: GraphState) -> str:
-    """For orchestrator routing to agents"""
-    classification = state['classification']
-
-    if classification.destination_node == "search_engine":
-        return "search_engine_path"
-    
-    elif classification.destination_node == "web_risk_test":
-        return "web_risk_test_path"
-
-
-
-# For continuing or ending loop
-def should_continue(state: GraphState) -> str:
-    """Decide if we should continue the loop or stop based upon whether the LLM made a tool call"""
-
-    messages = state["messages"]
-    last_message = messages[-1]
-
-    # If the LLM makes a tool call, then perform an action
-    if last_message.tool_calls:
-        return "search_tool_node_path"
-
-    # Otherwise, we stop (reply to the user)
-    return "end_path"
-
-
-workflow = (
-    StateGraph(GraphState, input_schema=InputState, output_schema=OutputState)
-        .add_node("orchestrator_node", orchestrator_node)
-        .add_node("search_engine_node", search_engine_node)
-
-        .add_node("search_tool_node", search_tool_node)
-        
-        .add_node("web_risk_test_node", web_risk_test_node)
-
-        
-        # edges
-
-        .add_edge(START, "orchestrator_node")
-
-
-        # choose sub-agent
-        .add_conditional_edges(
-            source="orchestrator_node",
-            path=route_to_agent,
-            path_map={
-                "search_engine_path": "search_engine_node",
-                "web_risk_test_path": "web_risk_test_node"
-            }
-        )
-
-
-        # call tool or immediately end
-        .add_conditional_edges(
-            source="search_engine_node",
-            path=should_continue,
-            path_map={
-                "search_tool_node_path": "search_tool_node",
-                "end_path": END
-            }
-        )
-
-
-        # pass tool output back to 
-        .add_edge("search_tool_node", "search_engine_node")
-        .add_edge("web_risk_test_node", END)
-
-        .compile(checkpointer=InMemorySaver())
-)
-
-
-
 def main():
-    """Conversation loop"""
+
+
+
+    workflow = (
+        StateGraph(OverallState, input_schema=InputState, output_schema=OutputState)
+            .add_node("orchestrator_node", orchestrator_node)
+            .add_node("search_query_generator_node", search_query_generator_node)
+            .add_node("deep_research_node", deep_research_node)
+
+            .add_edge(START, "orchestrator_node")
+            
+            .add_conditional_edges(
+                source="orchestrator_node",
+                path=route_to_agent,
+                path_map={
+                    "deep_research_path": "search_query_generator_node",
+                    # "risk_assessment_path": risk_assessment_node
+                }
+
+            )
+            
+
+            .add_edge("search_query_generator_node", "deep_research_node")
+            .add_edge("deep_research_node", END)
+
+            .compile(checkpointer=InMemorySaver())
+
+
+    )
+
 
     png_data = workflow.get_graph().draw_mermaid_png()
     with open("graph.png", "wb") as f:
         f.write(png_data)
         print("Graph saved as graph.png")
+
 
     config = {"configurable": {"thread_id": "1"}}
 
@@ -334,51 +313,235 @@ def main():
 
     while user_input != "exit":
 
-        stream_input = {
-            "messages": [HumanMessage(content=user_input)], 
-            "user_query": user_input,
-            "enable_tool_writer": True
-        }
+        result = workflow.invoke(
+            input={
+                'messages': user_input,
+                'user_query': user_input,
+                'enable_tool_writer': True
+            },
+            config=config
+        )
 
-        while stream_input is not None: 
-            stream = workflow.stream_events(
-                input=stream_input,
-                config=config,
-                version='v3',
-                transformers=[CustomTransformer]
-            )        
-
-            for name, item in stream.interleave("messages", "custom"):
-                if name == "messages":
-                    message = item
-
-                    if message.node == "orchestrator_node":
-                        continue
-
-                    for token in message.text:
-                        print(token, end="", flush=True)
-
-                elif name == "custom":
-                    print(f"\n[STATUS]: {item['status']}")
-            
-
-
-            if stream.interrupted:
-                interrupt_info = stream.interrupts[0].value
-                user_response = input(f"[INTERRUPT] {interrupt_info}: ")
-
-                stream_input = Command(resume=user_response)
-
-            else:
-                # no more interrupts
-                stream_input = None
-        
+        print(f"AI Response: {result}")
         # 3. Prompt for next input to avoid infinite loop
         user_input = input("\nNext message: ")
 
 
-
-# Conversation Flow
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ### TODO:
+
+
+
+# # a) Search Engine sub-agent
+# @traceable(run_type="chain")
+# def search_engine_node(state: GraphState) -> dict:
+#     search_engine_llm = base_llm.bind_tools(tools=search_tools, tool_choice="any")
+
+#     writer = get_stream_writer()
+
+#     # interruption_response = interrupt("Do you want to proceed with search?")
+    
+#     messages = state["messages"]
+
+#     # If we already have tool results, let the LLM
+#     # synthesize the final answer WITHOUT forcing another tool call.
+#     if isinstance(messages[-1], ToolMessage):
+
+#         writer({"status": "Search Node: Summarizing search tool results..."})
+
+#         response = base_llm.invoke(
+#             [
+#                 SystemMessage(
+#                     content="Use the search results to answer the user's request. "
+#                             "Keep the answer concise."
+#                 )
+#             ] + list(messages)
+#         )
+
+#     else:
+#         writer({"status": "Search Node: Using search engine tool..."})
+
+
+#         search_engine_llm = base_llm.bind_tools(
+#             tools=search_tools,
+#             tool_choice="any"
+#         )
+
+#         response = search_engine_llm.invoke(
+#             [
+#                 SystemMessage(
+#                     content="Use the available search tools to find information "
+#                             "needed to answer the user's request."
+#                 )
+#             ] + list(messages)
+#         )
+
+
+#     return {
+#         "messages": [response]
+#     }
+
+
+
+# # b) Web Risk sub-agent
+# @traceable(run_type="chain")
+# def web_risk_test_node(state: GraphState) -> dict:
+#     writer = get_stream_writer()
+#     writer({"status": "Conducting Web Risk API test..."})
+#     return {"messages": [AIMessage(f"The LLM chose to use `{state['classification'].destination_node}`. Went to the web risk node")]}
+
+
+
+# # Step 3: Routing Logic for Sub-agents
+# def route_to_agent(state: GraphState) -> str:
+#     """For orchestrator routing to agents"""
+#     classification = state['classification']
+
+#     if classification.destination_node == "search_engine":
+#         return "search_engine_path"
+    
+#     elif classification.destination_node == "web_risk_test":
+#         return "web_risk_test_path"
+
+
+
+# # For continuing or ending loop
+# def should_continue(state: GraphState) -> str:
+#     """Decide if we should continue the loop or stop based upon whether the LLM made a tool call"""
+
+#     messages = state["messages"]
+#     last_message = messages[-1]
+
+#     # If the LLM makes a tool call, then perform an action
+#     if last_message.tool_calls:
+#         return "search_tool_node_path"
+
+#     # Otherwise, we stop (reply to the user)
+#     return "end_path"
+
+
+# workflow = (
+#     StateGraph(GraphState, input_schema=InputState, output_schema=OutputState)
+#         .add_node("orchestrator_node", orchestrator_node)
+#         .add_node("search_engine_node", search_engine_node)
+
+#         .add_node("search_tool_node", search_tool_node)
+        
+#         .add_node("web_risk_test_node", web_risk_test_node)
+
+        
+#         # edges
+
+#         .add_edge(START, "orchestrator_node")
+
+
+#         # choose sub-agent
+#         .add_conditional_edges(
+#             source="orchestrator_node",
+#             path=route_to_agent,
+#             path_map={
+#                 "search_engine_path": "search_engine_node",
+#                 "web_risk_test_path": "web_risk_test_node"
+#             }
+#         )
+
+
+#         # call tool or immediately end
+#         .add_conditional_edges(
+#             source="search_engine_node",
+#             path=should_continue,
+#             path_map={
+#                 "search_tool_node_path": "search_tool_node",
+#                 "end_path": END
+#             }
+#         )
+
+
+#         # pass tool output back to 
+#         .add_edge("search_tool_node", "search_engine_node")
+#         .add_edge("web_risk_test_node", END)
+
+#         .compile(checkpointer=InMemorySaver())
+# )
+
+
+
+# def main():
+#     """Conversation loop"""
+
+#     png_data = workflow.get_graph().draw_mermaid_png()
+#     with open("graph.png", "wb") as f:
+#         f.write(png_data)
+#         print("Graph saved as graph.png")
+
+#     config = {"configurable": {"thread_id": "1"}}
+
+
+#     user_input = input("First message: ")
+
+#     while user_input != "exit":
+
+#         stream_input = {
+#             "messages": [HumanMessage(content=user_input)], 
+#             "user_query": user_input,
+#             "enable_tool_writer": True
+#         }
+
+#         while stream_input is not None: 
+#             stream = workflow.stream_events(
+#                 input=stream_input,
+#                 config=config,
+#                 version='v3',
+#                 transformers=[CustomTransformer]
+#             )        
+
+#             for name, item in stream.interleave("messages", "custom"):
+#                 if name == "messages":
+#                     message = item
+
+#                     if message.node == "orchestrator_node":
+#                         continue
+
+#                     for token in message.text:
+#                         print(token, end="", flush=True)
+
+#                 elif name == "custom":
+#                     print(f"\n[STATUS]: {item['status']}")
+            
+
+
+#             if stream.interrupted:
+#                 interrupt_info = stream.interrupts[0].value
+#                 user_response = input(f"[INTERRUPT] {interrupt_info}: ")
+
+#                 stream_input = Command(resume=user_response)
+
+#             else:
+#                 # no more interrupts
+#                 stream_input = None
+        
+#         # 3. Prompt for next input to avoid infinite loop
+#         user_input = input("\nNext message: ")
+
+
+
+# # Conversation Flow
+# if __name__ == "__main__":
+#     main()
 
