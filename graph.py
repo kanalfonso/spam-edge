@@ -18,7 +18,7 @@ from langgraph.config import get_stream_writer
 from langgraph.prebuilt import ToolNode
 from pydantic import BaseModel
 
-from langgraph.types import interrupt, Command
+from langgraph.types import interrupt, Command, Send
 from langgraph.stream import ProtocolEvent, StreamChannel, StreamTransformer
 from langgraph.checkpoint.memory import InMemorySaver
 
@@ -29,6 +29,10 @@ from langsmith import traceable
 
 # tool imports
 from tools.deep_research import arxiv_search_tool, duckduckgo_search_tool
+
+
+
+import operator
 
 
 # Configs
@@ -46,11 +50,15 @@ with open('prompts/02_deep_research_node/01_query_generator_sys_msg.txt', 'r') a
 with open('prompts/02_deep_research_node/02_deep_research_sys_msg.txt', 'r') as file:
     DEEP_RESEARCH_SYS_MSG_FILE = file.read()
 
+with open('prompts/02_deep_research_node/03_summarizer_sys_msg.txt', 'r') as file:
+    SUMMARIZER_SYS_MSG_FILE = file.read()
+
 
 
 ORCHESTRATOR_SYS_MSG = SystemMessage(content=ORCHESTRATOR_SYS_MSG_FILE)
 QUERY_GENERATOR_SYS_MSG = SystemMessage(content=QUERY_GENERATOR_SYS_MSG_FILE)
 DEEP_RESEARCH_SYS_MSG = SystemMessage(content=DEEP_RESEARCH_SYS_MSG_FILE)
+SUMMARIZER_SYS_MSG = SystemMessage(content=SUMMARIZER_SYS_MSG_FILE)
 
 
 
@@ -103,10 +111,10 @@ class Classification(BaseModel):
 
 
 class ResearchFormat(BaseModel):
-    reseach_results: str = Field(
+    research_results: str = Field(
         # min_length=100,  # Minimum character count
         # max_length=2000, # Maximum character count
-        description="Summarized findings from search results."
+        description="Report findings from the research topic."
     )
 
 
@@ -174,16 +182,22 @@ class QueryGeneratorOutputState(TypedDict):
     query_list: list[str]
 
 
+
 class DeepResearchInputState(TypedDict):
     """Input state required by the `deep_research_node`"""
-    query_list: list[str]
+    query: str
 
 
 class DeepResearchOutputState(TypedDict):
     """Output state produced by the `deep_research_node"""
-    reseach_results: list[str]
+    reseach_results: Annotated[list[str], operator.add]
 
 
+
+class ResearchSummarizerOutputState(TypedDict):
+    """Output state produced by the `research_summarizer_node"""
+
+    summarized_results: str
 
 
 ### deep research tools
@@ -233,6 +247,7 @@ def search_query_generator_node(state: QueryGeneratorInputState) -> QueryGenerat
     ### insert llm logic to generate queries
     query_generator_llm = base_llm.with_structured_output(QueryList)
 
+    # TODO: rethink if we should pass the entire convo `state['messages]` or just the user query `state['user_query]`
     conversation_history = [QUERY_GENERATOR_SYS_MSG] + state['messages']
 
     generated_queries: QueryList = query_generator_llm.invoke(input=conversation_history)
@@ -244,39 +259,69 @@ def search_query_generator_node(state: QueryGeneratorInputState) -> QueryGenerat
 
 
 
+
+def continue_to_deep_research(state: QueryGeneratorOutputState):
+    """Fan out generated search queries to parallel deep research nodes."""
+
+    return [
+        Send("deep_research_node", {"query": query}) 
+        for query in state['query_list']
+    ]
+
+
 def deep_research_node(state: DeepResearchInputState) -> DeepResearchOutputState:
     """Conduct deep research using LLM"""
 
     research_llm = base_llm.with_structured_output(ResearchFormat)
 
+    # format the query
+    query = f"Please make a report on the following research Topic: {state['query']}"
+    
+    conversation_history = [DEEP_RESEARCH_SYS_MSG] + [HumanMessage(query)]
 
-    research_results = []
-
-    for query in state['query_list']:
-
-        # format the query
-        query = f"Research Topic: {query}"
-        
-        conversation_history = [DEEP_RESEARCH_SYS_MSG] + [HumanMessage(query)]
-
-        result: ResearchFormat = research_llm.invoke(input=conversation_history)
-        research_results.append(result)
-
+    result: ResearchFormat = research_llm.invoke(input=conversation_history)
 
     return {
-        "reseach_results": [result.reseach_results for result in research_results]
+        "reseach_results": [result.research_results]
     }
 
 
+def research_summarizer_node(state: DeepResearchOutputState) -> ResearchSummarizerOutputState:
+    """Aggregate and summarize individual research results collected from parallel deep research nodes."""
+
+    # 1. Access the aggregated list of results from state
+    results = state.get("reseach_results", [])
+
+    if not results:
+        return {"summarized_results": "No research results available to summarize."}
+
+    # 2. Format the combined research payload for the LLM
+    formatted_results = "\n\n---\n\n".join(
+        f"Result {i+1}:\n{res}" for i, res in enumerate(results)
+    )
+
+    prompt = f"Synthesize the following research findings:\n\n{formatted_results}"
+    conversation_history = [SUMMARIZER_SYS_MSG, HumanMessage(content=prompt)]
+
+    # 3. Call the base LLM (or a structured output LLM)
+    response = base_llm.invoke(conversation_history)
+
+    # 4. Return the finalized summary
+    return {
+        "summarized_results": response.content
+    }
+
+
+
+
 def main():
-
-
 
     workflow = (
         StateGraph(OverallState, input_schema=InputState, output_schema=OutputState)
             .add_node("orchestrator_node", orchestrator_node)
             .add_node("search_query_generator_node", search_query_generator_node)
             .add_node("deep_research_node", deep_research_node)
+            .add_node("research_summarizer_node", research_summarizer_node)
 
             .add_edge(START, "orchestrator_node")
             
@@ -291,9 +336,11 @@ def main():
             )
             
 
-            .add_edge("search_query_generator_node", "deep_research_node")
-            .add_edge("deep_research_node", END)
-
+            # .add_edge("search_query_generator_node", "deep_research_node")
+            .add_conditional_edges("search_query_generator_node", continue_to_deep_research, ["deep_research_node"])
+            .add_edge("deep_research_node", "research_summarizer_node")
+            .add_edge("research_summarizer_node", END)
+            
             .compile(checkpointer=InMemorySaver())
 
 
